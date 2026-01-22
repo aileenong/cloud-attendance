@@ -877,6 +877,103 @@ def main():
                 st.warning("Enter an Employee ID.")
     elif page == "View Attendance":
         st.subheader("View Attendance Records")
+
+        # --- Build employee selectbox ---
+        employees_df = view_employees()
+        employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+        default_index = 0
+
+        selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+        selected_empid = selected_label.split(" - ")[0]
+        empid = selected_empid
+
+        # Default date range: current month
+        today = datetime.now(SGT).date()
+        first_day = today.replace(day=1)
+        if today.month == 12:
+            next_month = today.replace(year=today.year+1, month=1, day=1)
+        else:
+            next_month = today.replace(month=today.month+1, day=1)
+        last_day = next_month - timedelta(days=1)
+
+        col1, col2 = st.columns(2)
+        start_date = col1.date_input("From date", value=first_day)
+        end_date = col2.date_input("To date", value=last_day)
+
+        if st.button("View Attendance"):
+            if empid.strip():
+                res = (
+                    supabase_public.table("attendance")
+                    .select("timestamp, method")
+                    .eq("employee_id", empid.strip().upper())
+                    .order("timestamp")
+                    .execute()
+                )
+                records = res.data
+
+                if records:
+                    df = pd.DataFrame(records)
+                    df["timestamp"] = df["timestamp"].apply(format_sgt)
+                    df = df.sort_values("timestamp")
+
+                    summary = []
+                    clock_in = None
+
+                    for _, row in df.iterrows():
+                        if row["method"] == "CLOCK_IN":
+                            if clock_in is not None:
+                                # Previous clock-in never got a clock-out → mark incomplete
+                                summary.append({
+                                    "Date": clock_in.date(),
+                                    "CLOCKIN": clock_in.strftime("%H:%M:%S"),
+                                    "CLOCKOUT": "",
+                                    "Hours": None
+                                })
+                            clock_in = row["timestamp"]
+
+                        elif row["method"] == "CLOCK_OUT" and clock_in is not None:
+                            clock_out = row["timestamp"]
+                            duration = clock_out - clock_in
+                            hours = round(duration.total_seconds() / 3600.0, 2)
+                            summary.append({
+                                "Date": clock_in.date(),
+                                "CLOCKIN": clock_in.strftime("%H:%M:%S"),
+                                "CLOCKOUT": clock_out.strftime("%H:%M:%S"),
+                                "Hours": hours
+                            })
+                            clock_in = None
+
+                    # Handle last unmatched clock-in
+                    if clock_in is not None:
+                        summary.append({
+                            "Date": clock_in.date(),
+                            "CLOCKIN": clock_in.strftime("%H:%M:%S"),
+                            "CLOCKOUT": "",
+                            "Hours": None
+                        })
+
+                    summary_df = pd.DataFrame(summary)
+
+                    # Apply date filter
+                    mask = (summary_df["Date"] >= start_date) & (summary_df["Date"] <= end_date)
+                    summary_df = summary_df.loc[mask]
+
+                    st.dataframe(summary_df)
+
+                    # Clean Hours column
+                    summary_df["Hours"] = pd.to_numeric(summary_df["Hours"], errors="coerce").fillna(0)
+
+                    # Compute total
+                    total_hours = summary_df["Hours"].sum()
+                    st.write(f"**Grand Total Hours: {round(total_hours, 2)}**")
+
+                else:
+                    st.info(f"No attendance records found for {empid.strip()}.")
+            else:
+                st.warning("Enter an Employee ID.")
+
+    elif page == "View Attendance2":
+        st.subheader("View Attendance Records")
         # dropdown to select empid from users table with empid - name format
 
         # --- Build employee selectbox ---
