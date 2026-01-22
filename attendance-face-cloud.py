@@ -37,7 +37,8 @@ SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
 SUPABASE_SERVICE_KEY = st.secrets["SUPABASE_SERVICE_KEY"]
 
 # Public client (safe, uses anon key) for user-facing queries and auth
-supabase_public = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+#supabase_public = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase_public = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 # Admin client (privileged, uses service role key) for uploads, retraining, inserts
 supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -213,6 +214,7 @@ def log_attendance(empid_norm, method="CLOCK_IN", user_id=None):
     timestamp_sgt = datetime.now(SGT)
     timestamp_utc = timestamp_sgt.astimezone(timezone.utc).isoformat()
 
+    st.write(f"user_id{user_id}, empid_norm={empid_norm}, method={method}, timestamp_utc={timestamp_utc}")
     record = {
         "user_id": user_id,
         "employee_id": empid_norm,
@@ -241,21 +243,33 @@ def login_ui():
                     st.rerun()
             except Exception as e:
                 st.error(f"Login failed: {e}")
-    with col2:
-        if st.button("Logout"):
-            supabase_public.auth.sign_out()
-            st.session_state.pop("user", None)
-            st.rerun()
+#    with col2:
+#        if st.button("Logout"):
+#            supabase_public.auth.sign_out()
+#            st.session_state.pop("user", None)
+#            st.rerun()
 
 # ---------------- UI: upload and capture ----------------
 def upload_samples_ui():
     st.subheader("Upload face samples")
-    empid = st.text_input("Employee ID")
-    name = st.text_input("Full name")
+    #empid = st.text_input("Employee ID")
+    #name = st.text_input("Full name")
+
+    # --- Build employee selectbox ---
+    employees_df = view_employees()
+    employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+    default_index = 0
+
+    selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+    selected_empid = selected_label.split(" - ")[0]
+
+    empid = selected_empid
+
     files = st.file_uploader("Upload multiple images", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-    if files and empid and name and st.button("Save uploaded samples"):
-        empid_norm = empid.upper().strip()
+    if files and empid and st.button("Save uploaded samples"):
+        empid_norm = empid.strip()
         saved = 0
         for file in files:
             try:
@@ -271,27 +285,38 @@ def upload_samples_ui():
             upload_face_sample_to_storage(empid_norm, filename, face_resized)
             saved += 1
         register_employee_if_missing(empid_norm, name)
-        st.success(f"Uploaded {saved} samples for {name} ({empid_norm})")
+        st.success(f"Uploaded {saved} samples for {selected_label.strip()} ({empid_norm})")
 
 def capture_samples_ui():
     st.subheader("Capture face samples")
-    empid = st.text_input("Employee ID")
+
+    # --- Build employee selectbox ---
+    employees_df = view_employees()
+    employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+    default_index = 0
+
+    selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+    selected_empid = selected_label.split(" - ")[0]
+
+    empid = selected_empid
+    
     # from empid display the name if exists
-    if empid:
-        empid_norm = empid.strip()
-        st.write(f"Looking up name for {empid_norm}...")
-        existing = supabase_public.table("users").select("name").eq("employee_id", empid_norm).execute()
-        if existing.data:
-            st.write
-            name = existing.data[0].get("name", "")
-            st.info(f"Existing name for {empid_norm}: {name}")
-    else:
-        st.write("Enter Employee ID to lookup name.")
-        name = ""       
-        name = st.text_input("Full name")
+    #if empid:
+    #    empid_norm = empid.strip()
+        #st.write(f"Looking up name for {empid_norm}...")
+    #    existing = supabase_public.table("users").select("name").eq("employee_id", empid_norm).execute()
+    #    if existing.data:
+    #        st.write
+    #        name = existing.data[0].get("name", "")
+    #        st.info(f"Existing name for {empid_norm}: {name}")
+    #else:
+    #   st.write("Enter Employee ID to lookup name.")
+    #    name = ""       
+    #    name = st.text_input("Full name")
     img = st.camera_input("Take a photo")
 
-    if img and empid and name and st.button("Save captured sample"):
+    if img and empid and st.button("Save captured sample"):
         empid_norm = empid.upper().strip()
         pil_img = Image.open(img)
         face_resized, rect, gray = preprocess_face_from_pil(pil_img)
@@ -429,14 +454,37 @@ def has_attendance_today(empid):
     st.write(f"Attendance records found: {len(res.data)}")    
     return len(res.data) > 0
 
-
+#def get_user(empid):
+#    empid_norm = empid
+#    res = supabase_public.table("users").select("*").eq("employee_id", empid_norm).execute()
+#    if res.data:
+#        return res.data[0]
+#    return None
 
 def get_user(empid):
-    empid_norm = empid.upper().strip()
+    empid_norm = str(empid).strip()  # normalize to string
     res = supabase_public.table("users").select("*").eq("employee_id", empid_norm).execute()
-    if res.data:
-        return res.data[0]
+    #st.write("DEBUG Supabase response:", res.data)
+
+    if res.data and len(res.data) > 0:
+        return res.data[0]   # returns a dict
     return None
+
+
+
+# ---------------- Upload image to cloud for retraining ----------------
+def upload_image_to_cloud(img, empid, method):
+    """Upload captured image to Supabase Storage for retraining."""
+    empid_norm = empid.upper().strip()
+    pil_img = Image.open(img)
+    face_resized, rect, gray = preprocess_face_from_pil(pil_img)
+    if face_resized is None:
+        st.error("No face detected in the image. Cannot upload for retraining.")
+        return
+    filename = f"{empid_norm}_{int(time.time())}_{method}.png"
+    upload_face_sample_to_storage(empid_norm, filename, face_resized)
+    st.info(f"Uploaded image for {empid_norm} to cloud storage for retraining.")
+
 
 # ---------------- Get Attendance for today ----------------
 def get_attendance_for_today(empid):
@@ -446,7 +494,7 @@ def get_attendance_for_today(empid):
     res = (
         supabase.table("attendance")
         .select("timestamp, method")
-        .eq("employee_id", empid.strip().upper())
+        .eq("employee_id", empid)
         .order("timestamp")
         .execute()
     )
@@ -459,90 +507,148 @@ def get_attendance_for_today(empid):
     ]
 
     return todays_records
+# ---------------- View Employees ----------------
+def view_employees():
+
+    res = supabase_public.table("users").select("*").execute()
+    data = res.data
+    df = pd.DataFrame(data)
+    return df
+
 
 # ---------------- Attendance ----------------
 def attendance_check_ui():
     st.subheader("Mark attendance (camera)")
     img = st.camera_input("Take a photo")
-    if img:
-        recognizer, label_map = load_model_from_storage()
-        if recognizer is None:
-            return
+    if not img:
+        return
 
-        pil_img = Image.open(img)
-        gray = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
-        if len(faces) == 0:
-            st.warning("No face detected.")
-            return
+    recognizer, label_map = load_model_from_storage()
+    if recognizer is None:
+        return
 
-        (x, y, w, h) = sorted(faces, key=lambda r: r[2] * r[3], reverse=True)[0]
-        roi = gray[y:y+h, x:x+w]
-        face_resized = cv2.resize(roi, (200, 200))
-        label_id, confidence = recognizer.predict(face_resized)
+    pil_img = Image.open(img)
+    gray = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+    if len(faces) == 0:
+        st.warning("No face detected.")
+        return
 
-        inv_map = {v["id"]: k for k, v in label_map.items()}
-        empid = inv_map.get(label_id)
+    (x, y, w, h) = sorted(faces, key=lambda r: r[2] * r[3], reverse=True)[0]
+    roi = gray[y:y+h, x:x+w]
+    face_resized = cv2.resize(roi, (200, 200))
+    label_id, confidence = recognizer.predict(face_resized)
 
-        if empid:
-            user = get_user(empid)
-            name = user.get("name", "Unknown") if user else "Unknown"
+    inv_map = {v["id"]: k for k, v in label_map.items()}
+    recognized_empid = inv_map.get(label_id)
 
-            # Initialize session state dictionary
-            if "attendance_logged" not in st.session_state:
-                st.session_state.attendance_logged = {}
+    # --- Build employee selectbox ---
+    employees_df = view_employees()
+    #employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+    employee_options = employees_df.apply(
+        lambda row: f"{row['employee_id']} - {row['name']}", axis=1).values.tolist()
 
-            # Get today's records
-            attendance_today = get_attendance_for_today(empid)
-            has_clock_in = any(r["method"] == "CLOCK_IN" for r in attendance_today)
-            has_clock_out = any(r["method"] == "CLOCK_OUT" for r in attendance_today)
+    default_index = 0
+    if recognized_empid:
+        user = get_user(recognized_empid) or {}
+        recognized_label = f"{recognized_empid} - {user.get('name', 'Unknown')}"
+        if recognized_label in employee_options:
+            default_index = employee_options.index(recognized_label)
+            st.info(f"Recognized {recognized_label} (confidence {confidence:.2f}). You may override below if incorrect.")
+    else:
+        st.warning("Face not recognized. Please select employee manually.")
 
-            # Create a unique key for this employee and date
-            today_key = f"{empid}_{datetime.now(SGT).date()}"
+    #selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+    #selected_empid = int(selected_label.split(" - ")[0])
+    #selected_empid = selected_label.split(" - ")[0]
+    #selected_user = get_user(selected_empid)
 
-            if not has_clock_in:
-                st.info(f"{name} ({empid}) has not clocked in yet today. Next action will be CLOCK_IN.")
-                if st.button(f"Confirm CLOCK_IN for {name} ({empid})"):
-                    log_attendance(empid, method="CLOCK_IN", user_id=user["id"])
-                    st.success(f"Clock-in marked for {empid} (confidence {confidence:.2f})")
-                    st.session_state.attendance_logged[today_key] = "CLOCK_IN"
+    selected_label = st.selectbox("Select Employee", employee_options, index=default_index) if employee_options else None
 
-            elif has_clock_in and not has_clock_out:
-                st.info(f"{name} ({empid}) already clocked in today. Next action will be CLOCK_OUT.")
-                if st.button(f"Confirm CLOCK_OUT for {name} ({empid})"):
-                    log_attendance(empid, method="CLOCK_OUT", user_id=user["id"])
-                    st.success(f"Clock-out recorded for {empid}")
-                    st.session_state.attendance_logged[today_key] = "CLOCK_OUT"
+    if selected_label:
+        selected_empid = selected_label.split(" - ")[0]
+        empid = selected_empid
+    else:
+        empid = None
+        st.warning("No employees available to select.")
 
-            elif has_clock_in and has_clock_out:
-                st.info(f"{name} ({empid}) has already clocked in and clocked out today. No further action needed.")
 
-        else:
-            st.warning("Face not recognized. Please enter Employee ID manually.")
-            other_empid = st.text_input("Enter Employee ID:")
-            if other_empid:
-                other_user = get_user(other_empid)
-                if other_user:
-                    attendance_today = get_attendance_for_today(other_empid)
-                    has_clock_in = any(r["method"] == "CLOCK_IN" for r in attendance_today)
-                    has_clock_out = any(r["method"] == "CLOCK_OUT" for r in attendance_today)
+    # --- Attendance logic unified ---
+    attendance_today = get_attendance_for_today(selected_empid)
+    has_clock_in = any(r["method"] == "CLOCK_IN" for r in attendance_today)
+    has_clock_out = any(r["method"] == "CLOCK_OUT" for r in attendance_today)
 
-                    if not has_clock_in:
-                        st.info(f"{other_empid} has not clocked in yet today. Next action will be CLOCK_IN.")
-                        if st.button(f"Confirm CLOCK_IN for {other_empid}"):
-                            log_attendance(other_empid, method="CLOCK_IN", user_id=other_user["id"])
-                            st.success(f"Clock-in marked for {other_empid} (manual)")
+    if not has_clock_in:
+        st.info(f"{selected_empid} has not clocked in yet today. Next action will be CLOCK_IN.")
+        if st.button(f"Confirm CLOCK_IN for {selected_label}"):
+            #st.write("DEBUG: selected_empid =", selected_empid)
+            selected_user = get_user(selected_empid)
+            log_attendance(selected_empid, method="CLOCK_IN", user_id=selected_user["id"])
+            st.success(f"Clock-in marked for {selected_label}")
+            upload_image_to_cloud(img, selected_empid, "CLOCK_IN")
 
-                    elif has_clock_in and not has_clock_out:
-                        st.info(f"{other_empid} already clocked in today. Next action will be CLOCK_OUT.")
-                        if st.button(f"Confirm CLOCK_OUT for {other_empid}"):
-                            log_attendance(other_empid, method="CLOCK_OUT", user_id=other_user["id"])
-                            st.success(f"Clock-out recorded for {other_empid} (manual)")
+    elif has_clock_in and not has_clock_out:
+        st.info(f"{selected_empid} already clocked in today. Next action will be CLOCK_OUT.")
+        if st.button(f"Confirm CLOCK_OUT for {selected_label}"):
+            selected_user = get_user(selected_empid)
+            log_attendance(selected_empid, method="CLOCK_OUT", user_id=selected_user["id"])
+            st.success(f"Clock-out recorded for {selected_label}")
+            upload_image_to_cloud(img, selected_empid, "CLOCK_OUT")
 
-                    elif has_clock_in and has_clock_out:
-                        st.info(f"{other_empid} has already clocked in and clocked out today. No further action needed.")
+    elif has_clock_in and has_clock_out:
+        st.info(f"{selected_empid} has already clocked in and clocked out today. No further action needed.")
 
 def attendance_manual_ui():
+    st.subheader("Manual attendance (fallback)")
+
+    # Fetch all employees from users table
+    employees = supabase_public.table("users").select("employee_id, name, id").execute().data
+
+    if not employees:
+        st.warning("No employees found. Please register employees first.")
+        return
+
+    # Build dropdown options like "001 - Jemma"
+    options = {f"{emp['employee_id']} - {emp['name']}": emp for emp in employees}
+
+    # Insert default option at the top
+    labels = ["Select employee"] + list(options.keys())
+
+    selected_label = st.selectbox("Select Employee", labels)
+
+    if selected_label == "Select employee":
+        st.info("Please choose an employee from the dropdown.")
+        return
+
+    # Get the selected employee record
+    selected_emp = options[selected_label]
+    empid_norm = selected_emp["employee_id"]
+    name = selected_emp["name"]
+
+    st.info(f"Selected: {name} ({empid_norm})")
+
+    # Get today's records
+    attendance_today = get_attendance_for_today(empid_norm)
+    has_clock_in = any(r["method"] == "CLOCK_IN" for r in attendance_today)
+    has_clock_out = any(r["method"] == "CLOCK_OUT" for r in attendance_today)
+
+    if not has_clock_in:
+        st.info(f"{name} ({empid_norm}) has not clocked in yet today. Next action will be CLOCK_IN.")
+        if st.button(f"Confirm CLOCK_IN for {name} ({empid_norm})"):
+            log_attendance(empid_norm, method="CLOCK_IN", user_id=selected_emp["id"])
+            st.success(f"Clock-in marked for {empid_norm} (manual)")
+
+    elif has_clock_in and not has_clock_out:
+        st.info(f"{name} ({empid_norm}) already clocked in today. Next action will be CLOCK_OUT.")
+        if st.button(f"Confirm CLOCK_OUT for {name} ({empid_norm})"):
+            log_attendance(empid_norm, method="CLOCK_OUT", user_id=selected_emp["id"])
+            st.success(f"Clock-out recorded for {empid_norm} (manual)")
+
+    elif has_clock_in and has_clock_out:
+        st.info(f"{name} ({empid_norm}) has already clocked in and clocked out today. No further action needed.")
+
+
+def attendance_manual_ui2():
     st.subheader("Manual attendance (fallback)")
     empid = st.text_input("Employee ID")
     # show name of the employee if exists
@@ -621,6 +727,28 @@ def register_employee(empid, name):
     name = name.upper().strip()
     supabase_admin.table("users").insert({"employee_id": empid, "name": name}).execute()
 
+# ---------------- UI: Delete Employee ----------------
+def delete_employee_ui():
+    st.subheader("Delete employee")
+    # --- Build employee selectbox ---
+    employees_df = view_employees()
+    employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+    default_index = 0
+
+    selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+    selected_empid = selected_label.split(" - ")[0]
+    empid = selected_empid
+
+    if st.button("Delete"):
+        if empid:
+            empid_norm = empid.strip()
+            supabase_admin.table("users").delete().eq("employee_id", empid_norm).execute()
+            st.success(f"Deleted employee {empid_norm}")
+        else:
+            st.error("Please select an Employee ID.")
+
+
 def register_employee_ui():
     st.subheader("Register employee")
     empid = st.text_input("Employee ID")
@@ -657,12 +785,22 @@ def main():
         st.info("Please log in to continue.")
         return
 
+    #st.sidebar.markdown(f"Signed in as: {user.get('email','')} UUID: {st.session_state["user"]["id"]}")
     st.sidebar.markdown(f"Signed in as: {user.get('email','')}")
+
+    #res = supabase.table("users").select("*").execute()
+    #print(res.data)
+    if "user" in st.session_state:
+        if st.sidebar.button("Logout"):
+            supabase_public.auth.sign_out()
+            st.session_state.pop("user", None)
+            st.rerun()
 
     page = st.sidebar.radio(
         "Menu",
         [
             "Register Employee",
+            "Delete Employee",
             "Upload samples",
             "Capture samples",
             "Retrain model",
@@ -676,6 +814,8 @@ def main():
     )
     if page == "Register Employee":
         register_employee_ui()
+    if page == "Delete Employee":
+        delete_employee_ui()
     if page == "Upload samples":
         upload_samples_ui()
     elif page == "Capture samples":
@@ -690,12 +830,22 @@ def main():
         verify_lbph_labels_with_counts()
     elif page == "Daily Timesheet":
         st.subheader("Daily Timesheet")
-        empid = st.text_input("Employee ID for Daily Timesheet")
+
+        # --- Build employee selectbox ---
+        employees_df = view_employees()
+        employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+        default_index = 0
+
+        selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+        selected_empid = selected_label.split(" - ")[0]
+        empid = selected_empid
+
         if st.button("Get Daily Timesheet"):
             if empid.strip():
                 daily_breakdown, total_hours = calculate_daily_hours(empid)
 
-                st.subheader(f"Daily hours worked for {empid}")
+                st.subheader(f"Daily hours worked for {selected_label.strip()}")
                 for day, hours in daily_breakdown.items():
                     st.write(f"{day}: {hours}")
 
@@ -704,20 +854,40 @@ def main():
                 st.warning("Enter an Employee ID.")
     elif page == "Monthly Timesheet":
         st.subheader("Monthly Timesheet")
-        empid = st.text_input("Employee ID for Monthly Timesheet")
+
+        # --- Build employee selectbox ---
+        employees_df = view_employees()
+        employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+        default_index = 0
+
+        selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+        selected_empid = selected_label.split(" - ")[0]
+  
+        empid = selected_empid
         if st.button("Get Monthly Timesheet"):
             if empid.strip():
                 notes = []
                 total_hours = calculate_total_hours(empid, notes)
-                st.subheader(f"Total hours worked for {empid}")
-                st.write(f"Total hours worked for {empid.strip()}: {total_hours} hours")
+                st.subheader(f"Total hours worked for {selected_label.strip()}")
+                st.write(f"Total hours worked for {selected_label.strip()}: {total_hours} hours")
                 for note in notes:
                     st.write(note)
             else:
                 st.warning("Enter an Employee ID.")
     elif page == "View Attendance":
         st.subheader("View Attendance Records")
-        empid = st.text_input("Employee ID to View Attendance")
+        # dropdown to select empid from users table with empid - name format
+
+        # --- Build employee selectbox ---
+        employees_df = view_employees()
+        employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+        default_index = 0
+
+        selected_label = st.selectbox("Select Employee", employee_options, index=default_index)
+        selected_empid = selected_label.split(" - ")[0]
+        empid = selected_empid
 
         # Default date range: current month
         today = datetime.now(SGT).date()
@@ -755,7 +925,9 @@ def main():
                         clock_out = group.loc[group["method"] == "CLOCK_OUT", "timestamp"].max()
 
                         # Calculate hours if both exist
-                        hours = ""
+                        #hours = ""
+                        hours = np.nan
+
                         if pd.notnull(clock_in) and pd.notnull(clock_out):
                             duration = clock_out - clock_in
                             hours = round(duration.total_seconds() / 3600.0, 2)
@@ -778,8 +950,16 @@ def main():
                     st.info(f"No attendance records found for {empid.strip()}.")
             else:
                 st.warning("Enter an Employee ID.")
-            total_hours = summary_df["Hours"].replace("", 0).astype(float).sum()
+
+            # Clean Hours column once
+            summary_df["Hours"] = pd.to_numeric(summary_df["Hours"].mask(summary_df["Hours"] == "", 0), errors="coerce")
+
+            # Compute total
+            total_hours = summary_df["Hours"].sum()
+
             st.write(f"**Grand Total Hours: {round(total_hours, 2)}**")
+
+
 
 if __name__ == "__main__":
     main()
