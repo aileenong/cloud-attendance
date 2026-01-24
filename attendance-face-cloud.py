@@ -14,6 +14,7 @@ from supabase import create_client, Client
 import pandas as pd
 from collections import defaultdict
 
+import pytz
 
 # ---------------- Config ----------------
 st.set_page_config(page_title="Face Attendance (Supabase)", layout="wide")
@@ -760,6 +761,77 @@ def register_employee_ui():
         else:
             st.error("Please enter both Employee ID and Name.")
 
+# -------------- Delete Attendance of an employee --------------
+SGT = pytz.timezone("Asia/Singapore")
+
+def format_sgt(utc_ts):
+    return pd.to_datetime(utc_ts).astimezone(SGT)
+
+def delete_attendance_records(supabase_client):
+    st.subheader("Delete Attendance Records")
+
+    # --- Step 1: Select Employee ---
+    employees_df = view_employees()  # assumes this returns a DataFrame with 'employee_id' and 'name'
+    employee_options = employees_df.apply(lambda row: f"{row['employee_id']} - {row['name']}", axis=1).tolist()
+
+    selected_label = st.selectbox("Select Employee", employee_options)
+    selected_empid = selected_label.split(" - ")[0].strip().upper()
+
+    # --- Step 2: Fetch Attendance Records ---
+    res = (
+        supabase_client.table("attendance")
+        .select("id, user_id, timestamp, method, employee_id")
+        .eq("employee_id", selected_empid)
+        .order("timestamp")
+        .execute()
+    )
+    records = res.data
+
+    if not records:
+        st.info(f"No attendance records found for {selected_empid}.")
+        return
+
+    # --- Step 3: Show Records in a Table ---
+    df = pd.DataFrame(records)
+    df["timestamp"] = df["timestamp"].apply(format_sgt)
+    st.write("### Attendance Records")
+    st.dataframe(df)
+
+    # --- Step 4: Build label → record mapping ---
+    label_to_record = {}
+    delete_options = []
+
+    for r in records:
+        sgt_dt = format_sgt(r["timestamp"])
+        label = f"{sgt_dt.strftime('%Y-%m-%d %H:%M:%S')} - {r['method']}"
+        label_to_record[label] = r
+        delete_options.append(label)
+
+    # --- Step 4: Multi-select widget ---
+    selected_labels = st.multiselect("Select records to delete", delete_options)
+
+    # --- Step 5: Show selected records ---
+    if selected_labels:
+        st.write("### Selected Records")
+        for label in selected_labels:
+            r = label_to_record[label]
+            sgt_dt = format_sgt(r["timestamp"])
+            st.write(f"🗓️ {sgt_dt.strftime('%Y-%m-%d %H:%M:%S')} | Method: {r['method']} | ID: {r['id']}")
+
+    # --- Step 6: Delete logic ---
+    if st.button("Delete Selected"):
+        deleted_count = 0
+        for label in selected_labels:
+            r = label_to_record[label]
+            supabase_client.table("attendance").delete().eq("id", r["id"]).execute()
+            deleted_count += 1
+
+        st.success(f"✅ Deleted {deleted_count} attendance record(s) for employee {selected_empid}.")
+        st.rerun()
+
+
+
+
 # ---------------- Main ----------------
 def main():
     st.title("Attendance with Face Recognition (Supabase + Streamlit)")
@@ -809,7 +881,8 @@ def main():
             "Manual attendance",
             "Daily Timesheet",
             "Monthly Timesheet",
-            "View Attendance"
+            "View Attendance",
+            "Delete Attendance"
         ],
     )
     if page == "Register Employee":
@@ -904,7 +977,7 @@ def main():
             if empid.strip():
                 res = (
                     supabase_public.table("attendance")
-                    .select("timestamp, method")
+                    .select("id, timestamp, method, employee_id")
                     .eq("employee_id", empid.strip().upper())
                     .order("timestamp")
                     .execute()
@@ -970,7 +1043,10 @@ def main():
                 else:
                     st.info(f"No attendance records found for {empid.strip()}.")
             else:
-                st.warning("Enter an Employee ID.")
+                st.warning("Select an Employee ID.")
+        
+    elif page == "Delete Attendance":
+        delete_attendance_records(supabase_public)
 
     elif page == "View Attendance2":
         st.subheader("View Attendance Records")
@@ -1055,8 +1131,6 @@ def main():
             total_hours = summary_df["Hours"].sum()
 
             st.write(f"**Grand Total Hours: {round(total_hours, 2)}**")
-
-
 
 if __name__ == "__main__":
     main()
