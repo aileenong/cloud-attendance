@@ -242,18 +242,22 @@ def login_ui():
 
                 if user:
                     # Query the profiles table for the role
-                    profile_res = supabase.table("profiles").select("role").eq("id", user.id).execute()
+                    profile_res = supabase.table("profiles").select("role","name").eq("id", user.id).execute()
 
                     if profile_res.data and len(profile_res.data) > 0:
                         role = profile_res.data[0]["role"]
+                        name = profile_res.data[0]["name"]
+                        st.write(f"Profile name found: {name}")
                     else:
+                        name = ""
                         role = "attendance_only"  # default if no profile found
 
                     # Store user info + role in session state
                     st.session_state["user"] = {
                         "id": user.id,
                         "email": user.email,
-                        "role": role
+                        "role": role,
+                        "name": name
                     }
 
                     st.success(f"Logged in as {user.email} with role: {role}")
@@ -1122,7 +1126,8 @@ def main():
         return
 
     #st.sidebar.markdown(f"Signed in as: {user.get('email','')} UUID: {st.session_state["user"]["id"]}")
-    st.sidebar.markdown(f"Signed in as: {user.get('email','')}")
+    #st.sidebar.markdown(f"Signed in as: {user.get('email','')}")
+    st.sidebar.markdown(f"Signed in as: {user.get('email','')} - {user.get('name','')}")
 
     # store role in session state
     user = st.session_state.get("user")
