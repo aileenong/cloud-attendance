@@ -16,6 +16,9 @@ from collections import defaultdict
 
 import pytz
 
+import gzip
+import shutil
+
 # ---------------- Config ----------------
 st.set_page_config(page_title="Face Attendance (Supabase)", layout="wide")
 
@@ -335,107 +338,6 @@ def capture_samples_ui():
         register_employee_if_missing(empid_norm, name)
         st.success(f"Saved sample for {name} ({empid_norm})")
 
-def retrain_lbph_from_storage_ui2():   # old version - delete if the new version works
-    st.subheader("Retrain LBPH model from cloud images")
-    if st.button("Retrain now"):
-        try:
-            ensure_tmp_dir()
-            folders = list_employee_folders()
-            if not folders:
-                st.error("No folders found in faces bucket.")
-                return
-
-            X, y = [], []
-            for folder in folders:
-                empid = folder.get("name")
-                if not empid:
-                    continue
-                files = list_files_in_folder(empid)
-                for f in files:
-                    fname = f.get("name")
-                    if not fname:
-                        continue
-                    path = f"{empid}/{fname}"
-                    img_bytes = download_file_bytes(FACES_BUCKET, path)
-                    img_array = np.frombuffer(img_bytes, np.uint8)
-                    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-                    if img is None:
-                        continue
-                    face_resized = cv2.resize(img, (200, 200))
-                    X.append(face_resized)
-                    y.append(empid.upper().strip())
-            st.write(f"Found {len(X)} samples from {len(set(y))} employees.")
-            if not X:
-                st.error("No valid samples found.")
-                return
-
-            try:
-                res = supabase.storage.from_("models").download(LABEL_MAP_FILENAME)
-                old_label_map = np.load(io.BytesIO(res), allow_pickle=True).item()
-            except Exception:
-                old_label_map = {}
-
-            st.write(f"Loaded {len(old_label_map)} existing labels from Supabase.")
-
-            # Normalize old label map into dict format {id, name}
-            normalized_label_map = {}
-            for emp, val in old_label_map.items():
-                if isinstance(val, dict):
-                    normalized_label_map[emp] = {"id": int(val["id"]), "name": val.get("name", emp)}
-                else:
-                    # legacy int-only format → wrap into dict
-                    normalized_label_map[emp] = {"id": int(val), "name": emp}
-
-            # Merge old and new labels
-            unique = sorted(set(y))
-            st.write(f"Unique labels in current data: {len(unique)}")
-
-            label_map = normalized_label_map.copy()
-            next_id = max([v["id"] for v in label_map.values()], default=-1) + 1
-            st.write(f"Starting label map size: {len(label_map)}")
-            st.write(f"Next label ID to assign: {next_id}")
-
-            for emp in unique:
-                if emp not in label_map:
-                    label_map[emp] = {"id": next_id, "name": emp}
-                    next_id += 1
-
-            st.write(f"Merged label map size: {len(label_map)}")
-
-            # Encode labels using the normalized dict format
-            y_encoded = np.array([label_map[e]["id"] for e in y], dtype=np.int32)
-
-            st.write(f"Total labels after merging: {len(label_map)}")
-
-
-            # Load existing model if available
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
-            try:
-                model_bytes = supabase.storage.from_("models").download(LBPH_MODEL_FILENAME)
-                tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
-                with open(tmp_model_path, "wb") as f:
-                    f.write(model_bytes)
-                recognizer.read(tmp_model_path)
-                recognizer.update(X, y_encoded)   # Incremental update
-            except Exception:
-                recognizer.train(X, y_encoded)    # First-time training
-            st.write("Model trained/updated.")
-            # Save updated model locally then upload to Supabase
-            tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
-            recognizer.write(tmp_model_path)
-            with open(tmp_model_path, "rb") as f:
-                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME, f.read(), {"upsert": "true"})
-            st.write("Model uploaded to Supabase.")
-            # Save label map directly to Supabase
-            buf = io.BytesIO()
-            np.save(buf, label_map)
-            buf.seek(0)
-            supabase.storage.from_("models").upload(LABEL_MAP_FILENAME, buf.read(), {"upsert": "true"})
-            st.write("Label map uploaded to Supabase.")
-            st.success("Model and label map updated in Supabase.")
-        except Exception as e:
-            st.error(f"Retraining failed: {e}")
-
 def delete_corrupted_files(corrupted_files):   # new function - delete corrupted or empty files
     """Delete corrupted or zero-size files from Supabase Storage."""
     for path in corrupted_files:
@@ -445,7 +347,7 @@ def delete_corrupted_files(corrupted_files):   # new function - delete corrupted
         except Exception as e:
             st.warning(f"Failed to delete {path}: {e}")
 
-def retrain_lbph_from_storage_ui():
+def retrain_lbph_from_storage_ui4():  # to  be removed if the updated one works
     st.subheader("Retrain LBPH model from cloud images")
     if st.button("Retrain now"):
         try:
@@ -560,6 +462,402 @@ def retrain_lbph_from_storage_ui():
         except Exception as e:
             st.error(f"Retraining failed: {e}")
 
+# Constants
+FACES_BUCKET = "faces"
+LABEL_MAP_FILENAME = "label_map.npy"
+LBPH_MODEL_FILENAME = "lbph_model.xml"
+TMP_DIR = "/tmp"
+SGT = timezone(timedelta(hours=8))
+
+def ensure_tmp_dir():
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+def compress_file(input_path, output_path):
+    with open(input_path, "rb") as f_in, gzip.open(output_path, "wb") as f_out:
+        f_out.writelines(f_in)
+
+def retrain_lbph_from_storage_ui():
+    st.subheader("New version - Retrain LBPH model from cloud images")
+    if st.button("Retrain now"):
+        try:
+            ensure_tmp_dir()
+            folders = list_employee_folders()
+            if not folders:
+                st.error("No folders found in faces bucket.")
+                return
+
+            X, y, corrupted_files = [], [], []
+
+            for folder in folders:
+                empid = folder.get("name")
+                if not empid:
+                    continue
+                files = list_files_in_folder(empid)
+                for f in files:
+                    fname = f.get("name")
+                    if not fname:
+                        continue
+                    path = f"{empid}/{fname}"
+                    img_bytes = download_file_bytes(FACES_BUCKET, path)
+
+                    # Check for empty or corrupted files
+                    if not img_bytes or len(img_bytes) == 0:
+                        corrupted_files.append(path)
+                        continue
+
+                    img_array = np.frombuffer(img_bytes, np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        corrupted_files.append(path)
+                        continue
+
+                    face_resized = cv2.resize(img, (200, 200))
+                    X.append(face_resized)
+                    y.append(empid.upper().strip())
+
+            st.write(f"Found {len(X)} valid samples from {len(set(y))} employees.")
+
+            # Auto-delete corrupted files if any
+            if corrupted_files:
+                delete_corrupted_files(corrupted_files)
+                st.warning("The following corrupted files were auto-deleted from Supabase:")
+                for cf in corrupted_files:
+                    st.write(f"- {cf}")
+
+            if not X:
+                st.error("No valid samples found.")
+                return
+
+            # Load existing label map if available
+            try:
+                res = supabase.storage.from_("models").download(LABEL_MAP_FILENAME)
+                old_label_map = np.load(io.BytesIO(res), allow_pickle=True).item()
+            except Exception:
+                old_label_map = {}
+
+            st.write(f"Loaded {len(old_label_map)} existing labels from Supabase.")
+
+            # Normalize old label map
+            normalized_label_map = {}
+            for emp, val in old_label_map.items():
+                if isinstance(val, dict):
+                    normalized_label_map[emp] = {"id": int(val["id"]), "name": val.get("name", emp)}
+                else:
+                    normalized_label_map[emp] = {"id": int(val), "name": emp}
+
+            # Merge old and new labels
+            unique = sorted(set(y))
+            label_map = normalized_label_map.copy()
+            next_id = max([v["id"] for v in label_map.values()], default=-1) + 1
+
+            for emp in unique:
+                if emp not in label_map:
+                    label_map[emp] = {"id": next_id, "name": emp}
+                    next_id += 1
+
+            y_encoded = np.array([label_map[e]["id"] for e in y], dtype=np.int32)
+
+            # Train or update LBPH model
+            recognizer = cv2.face.LBPHFaceRecognizer_create()
+            try:
+                model_bytes = supabase.storage.from_("models").download(LBPH_MODEL_FILENAME)
+                tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+                with open(tmp_model_path, "wb") as f:
+                    f.write(model_bytes)
+                recognizer.read(tmp_model_path)
+                recognizer.update(X, y_encoded)
+            except Exception:
+                recognizer.train(X, y_encoded)
+
+            st.write("Model trained/updated.")
+
+            # Save updated model
+            tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+            recognizer.write(tmp_model_path)
+
+            # --- Upload raw XML ---
+            with open(tmp_model_path, "rb") as f:
+                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME, f.read(), {"upsert": "true"})
+            st.write("Raw model uploaded to Supabase (lbph_model.xml).")
+
+            # --- Upload compressed XML.gz ---
+            compressed_model_path = tmp_model_path + ".gz"
+            compress_file(tmp_model_path, compressed_model_path)
+            with open(compressed_model_path, "rb") as f:
+                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME + ".gz", f.read(), {"upsert": "true"})
+            st.write("Compressed model uploaded to Supabase (lbph_model.xml.gz).")
+
+            # Save and upload label map (uncompressed for easy verification)
+            buf = io.BytesIO()
+            np.save(buf, label_map)
+            buf.seek(0)
+            supabase.storage.from_("models").upload(LABEL_MAP_FILENAME, buf.read(), {"upsert": "true"})
+            st.write("Label map uploaded to Supabase (uncompressed).")
+
+            st.success("Model (raw + compressed) and label map updated in Supabase.")
+        except Exception as e:
+            st.error(f"Retraining failed: {e}")
+
+# Constants
+FACES_BUCKET = "faces"
+LABEL_MAP_FILENAME = "label_map.npy"
+LBPH_MODEL_FILENAME = "lbph_model.xml"
+TMP_DIR = "/tmp"
+SGT = timezone(timedelta(hours=8))
+
+def ensure_tmp_dir():
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+def compress_file(input_path, output_path):
+    with open(input_path, "rb") as f_in, gzip.open(output_path, "wb") as f_out:
+        f_out.writelines(f_in)
+
+def retrain_lbph_from_storage_ui():
+    st.subheader("New version - Retrain LBPH model from cloud images")
+    if st.button("Retrain now"):
+        try:
+            ensure_tmp_dir()
+            folders = list_employee_folders()
+            if not folders:
+                st.error("No folders found in faces bucket.")
+                return
+
+            X, y, corrupted_files = [], [], []
+
+            for folder in folders:
+                empid = folder.get("name")
+                if not empid:
+                    continue
+                files = list_files_in_folder(empid)
+                for f in files:
+                    fname = f.get("name")
+                    if not fname:
+                        continue
+                    path = f"{empid}/{fname}"
+                    img_bytes = download_file_bytes(FACES_BUCKET, path)
+
+                    # Check for empty or corrupted files
+                    if not img_bytes or len(img_bytes) == 0:
+                        corrupted_files.append(path)
+                        continue
+
+                    img_array = np.frombuffer(img_bytes, np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        corrupted_files.append(path)
+                        continue
+
+                    face_resized = cv2.resize(img, (200, 200))
+                    X.append(face_resized)
+                    y.append(empid.upper().strip())
+
+            st.write(f"Found {len(X)} valid samples from {len(set(y))} employees.")
+
+            # Auto-delete corrupted files if any
+            if corrupted_files:
+                delete_corrupted_files(corrupted_files)
+                st.warning("The following corrupted files were auto-deleted from Supabase:")
+                for cf in corrupted_files:
+                    st.write(f"- {cf}")
+
+            if not X:
+                st.error("No valid samples found.")
+                return
+
+            # Load existing label map if available
+            try:
+                res = supabase.storage.from_("models").download(LABEL_MAP_FILENAME)
+                old_label_map = np.load(io.BytesIO(res), allow_pickle=True).item()
+            except Exception:
+                old_label_map = {}
+
+            st.write(f"Loaded {len(old_label_map)} existing labels from Supabase.")
+
+            # Normalize old label map
+            normalized_label_map = {}
+            for emp, val in old_label_map.items():
+                if isinstance(val, dict):
+                    normalized_label_map[emp] = {"id": int(val["id"]), "name": val.get("name", emp)}
+                else:
+                    normalized_label_map[emp] = {"id": int(val), "name": emp}
+
+            # Merge old and new labels
+            unique = sorted(set(y))
+            label_map = normalized_label_map.copy()
+            next_id = max([v["id"] for v in label_map.values()], default=-1) + 1
+
+            for emp in unique:
+                if emp not in label_map:
+                    label_map[emp] = {"id": next_id, "name": emp}
+                    next_id += 1
+
+            y_encoded = np.array([label_map[e]["id"] for e in y], dtype=np.int32)
+
+            # Train or update LBPH model
+            recognizer = cv2.face.LBPHFaceRecognizer_create()
+            try:
+                model_bytes = supabase.storage.from_("models").download(LBPH_MODEL_FILENAME)
+                tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+                with open(tmp_model_path, "wb") as f:
+                    f.write(model_bytes)
+                recognizer.read(tmp_model_path)
+                recognizer.update(X, y_encoded)
+            except Exception:
+                recognizer.train(X, y_encoded)
+
+            st.write("Model trained/updated.")
+
+            # Save updated model
+            tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+            recognizer.write(tmp_model_path)
+
+            # --- Upload raw XML ---
+            with open(tmp_model_path, "rb") as f:
+                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME, f.read(), {"upsert": "true"})
+            st.write("Raw model uploaded to Supabase (lbph_model.xml).")
+
+            # --- Upload compressed XML.gz ---
+            compressed_model_path = tmp_model_path + ".gz"
+            compress_file(tmp_model_path, compressed_model_path)
+            with open(compressed_model_path, "rb") as f:
+                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME + ".gz", f.read(), {"upsert": "true"})
+            st.write("Compressed model uploaded to Supabase (lbph_model.xml.gz).")
+
+            # Save and upload label map (uncompressed for easy verification)
+            buf = io.BytesIO()
+            np.save(buf, label_map)
+            buf.seek(0)
+            supabase.storage.from_("models").upload(LABEL_MAP_FILENAME, buf.read(), {"upsert": "true"})
+            st.write("Label map uploaded to Supabase (uncompressed).")
+
+            st.success("Model (raw + compressed) and label map updated in Supabase.")
+        except Exception as e:
+            st.error(f"Retraining failed: {e}")
+
+def ensure_tmp_dir5():
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+def compress_file5(src, dst):
+    """Compress a file using gzip."""
+    with open(src, 'rb') as f_in, gzip.open(dst, 'wb') as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+def retrain_lbph_from_storage_ui5():
+    st.subheader("New version - Retrain LBPH model from cloud images")
+    if st.button("Retrain now"):
+        try:
+            ensure_tmp_dir()
+            folders = list_employee_folders()
+            if not folders:
+                st.error("No folders found in faces bucket.")
+                return
+
+            X, y, corrupted_files = [], [], []
+
+            for folder in folders:
+                empid = folder.get("name")
+                if not empid:
+                    continue
+                files = list_files_in_folder(empid)
+                for f in files:
+                    fname = f.get("name")
+                    if not fname:
+                        continue
+                    path = f"{empid}/{fname}"
+                    img_bytes = download_file_bytes(FACES_BUCKET, path)
+
+                    # Check for empty or corrupted files
+                    if not img_bytes or len(img_bytes) == 0:
+                        corrupted_files.append(path)
+                        continue
+
+                    img_array = np.frombuffer(img_bytes, np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        corrupted_files.append(path)
+                        continue
+
+                    face_resized = cv2.resize(img, (200, 200))
+                    X.append(face_resized)
+                    y.append(empid.upper().strip())
+
+            st.write(f"Found {len(X)} valid samples from {len(set(y))} employees.")
+
+            # Auto-delete corrupted files if any
+            if corrupted_files:
+                delete_corrupted_files(corrupted_files)
+                st.warning("The following corrupted files were auto-deleted from Supabase:")
+                for cf in corrupted_files:
+                    st.write(f"- {cf}")
+
+            if not X:
+                st.error("No valid samples found.")
+                return
+
+            # Load existing label map if available
+            try:
+                res = supabase.storage.from_("models").download(LABEL_MAP_FILENAME)
+                old_label_map = np.load(io.BytesIO(res), allow_pickle=True).item()
+            except Exception:
+                old_label_map = {}
+
+            st.write(f"Loaded {len(old_label_map)} existing labels from Supabase.")
+
+            # Normalize old label map
+            normalized_label_map = {}
+            for emp, val in old_label_map.items():
+                if isinstance(val, dict):
+                    normalized_label_map[emp] = {"id": int(val["id"]), "name": val.get("name", emp)}
+                else:
+                    normalized_label_map[emp] = {"id": int(val), "name": emp}
+
+            # Merge old and new labels
+            unique = sorted(set(y))
+            label_map = normalized_label_map.copy()
+            next_id = max([v["id"] for v in label_map.values()], default=-1) + 1
+
+            for emp in unique:
+                if emp not in label_map:
+                    label_map[emp] = {"id": next_id, "name": emp}
+                    next_id += 1
+
+            y_encoded = np.array([label_map[e]["id"] for e in y], dtype=np.int32)
+
+            # Train or update LBPH model
+            recognizer = cv2.face.LBPHFaceRecognizer_create()
+            try:
+                model_bytes = supabase.storage.from_("models").download(LBPH_MODEL_FILENAME)
+                tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+                with open(tmp_model_path, "wb") as f:
+                    f.write(model_bytes)
+                recognizer.read(tmp_model_path)
+                recognizer.update(X, y_encoded)
+            except Exception:
+                recognizer.train(X, y_encoded)
+
+            st.write("Model trained/updated.")
+
+            # Save updated model
+            tmp_model_path = os.path.join(TMP_DIR, LBPH_MODEL_FILENAME)
+            recognizer.write(tmp_model_path)
+
+            # Compress and upload model (to avoid payload size error)
+            compressed_model_path = tmp_model_path + ".gz"
+            compress_file(tmp_model_path, compressed_model_path)
+            with open(compressed_model_path, "rb") as f:
+                supabase.storage.from_("models").upload(LBPH_MODEL_FILENAME, f.read(), {"upsert": "true"})
+            st.write("Compressed model uploaded to Supabase (stored as lbph_model.xml).")
+
+            # Save and upload label map (uncompressed for easy verification)
+            buf = io.BytesIO()
+            np.save(buf, label_map)
+            buf.seek(0)
+            supabase.storage.from_("models").upload(LABEL_MAP_FILENAME, buf.read(), {"upsert": "true"})
+            st.write("Label map uploaded to Supabase (uncompressed).")
+
+            st.success("Model (compressed) and label map (uncompressed) updated in Supabase.")
+        except Exception as e:
+            st.error(f"Retraining failed: {e}")
 
 SGT = timezone(timedelta(hours=8))
 
@@ -811,7 +1109,57 @@ def attendance_manual_ui2():
         else:
             st.warning("Employee does not exist. Please register first.")
 
+
 def verify_lbph_labels_with_counts(min_images=10):
+    """List all employees in the LBPH model, their image counts, and warn if below threshold.
+       Reads label_map.npy directly from Supabase storage instead of local."""
+    try:
+        # Try to download label map from Supabase
+        try:
+            res = supabase.storage.from_("models").download(LABEL_MAP_FILENAME)
+
+            # Handle different return types
+            if isinstance(res, bytes):
+                raw_bytes = res
+            elif hasattr(res, "data"):
+                raw_bytes = res.data
+            elif hasattr(res, "content"):
+                raw_bytes = res.content
+            else:
+                raise ValueError("Unexpected download return type")
+
+            # Load label map from raw bytes
+            label_map = np.load(io.BytesIO(raw_bytes), allow_pickle=True).item()
+
+        except Exception as inner_e:
+            st.warning(f"No label map found in Supabase. Train or retrain the model first. ({inner_e})")
+            return
+
+        st.subheader("Employees in Current Model")
+        counts = {}
+
+        # Count images per employee by checking Supabase folders
+        for emp in label_map.keys():
+            files = list_files_in_folder(emp)  # helper that lists files in Supabase bucket
+            counts[emp] = len(files)
+
+        # Show total employees
+        st.info(f"Total employees in model: {len(label_map)}")
+
+        for emp, data in label_map.items():
+            idx = data["id"] if isinstance(data, dict) else data
+            name = data["name"] if isinstance(data, dict) else emp
+
+            count = counts.get(emp, 0)
+            if count < min_images:
+                st.warning(f"ID {idx}: {emp} ({name}) → {count} images (⚠️ below recommended {min_images})")
+            else:
+                st.write(f"ID {idx}: {emp} ({name}) → {count} images")
+
+    except Exception as e:
+        st.error(f"Verification failed: {e}")
+
+def verify_lbph_labels_with_counts2(min_images=10):
     """List all employees in the LBPH model, their image counts, and warn if below threshold.
        Reads label_map.npy directly from Supabase storage instead of local."""
     try:
@@ -850,7 +1198,9 @@ def verify_lbph_labels_with_counts(min_images=10):
 def register_employee(empid, name):
     empid = empid.strip()
     name = name.upper().strip()
+
     supabase_admin.table("users").insert({"employee_id": empid, "name": name}).execute()
+    st.success(f"Employee '{name}' with ID '{empid}' registered successfully.")
 
 # ---------------- UI: Delete Employee ----------------
 def delete_employee_ui():
@@ -880,8 +1230,15 @@ def register_employee_ui():
     name = st.text_input("Full name")
     if st.button("Register"):
         if empid and name:
-            register_employee(empid, name)
-            st.success(f"Registered {empid.strip()} - {name}")
+            # Check if employee_id already exists
+            existing = supabase_admin.table("users").select("employee_id").eq("employee_id", empid).execute()
+
+            if existing.data and len(existing.data) > 0:
+                st.error(f"Employee ID '{empid}' already exists. Registration not allowed.")
+            else:    
+                # Insert new employee if not duplicate
+                register_employee(empid, name)
+                st.success(f"Registered {empid.strip()} - {name}")
         else:
             st.error("Please enter both Employee ID and Name.")
 
